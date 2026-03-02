@@ -66,31 +66,22 @@ def extract_coordinates_from_url(url: str):
 
 
 # ==============================
-# 🔢 PARSERS ROBUSTOS
+# 🔢 PARSERS
 # ==============================
 
 
 def parse_int(text: str) -> int:
-    """
-    Extrai inteiro de textos como:
-    '1.623 avaliações', '1,623 reviews', etc.
-    """
     digits = re.sub(r"\D", "", text)
     return int(digits) if digits else 0
 
 
 def parse_float(text: str) -> float:
-    """
-    Extrai float de textos como:
-    '4,5 estrelas', '4.5 stars'
-    """
     match = re.search(r"[\d.,]+", text)
     if not match:
         return 0.0
 
     value = match.group(0)
 
-    # se tem vírgula como decimal (pt-BR)
     if "," in value and value.count(",") == 1:
         value = value.replace(".", "").replace(",", ".")
     else:
@@ -100,7 +91,57 @@ def parse_float(text: str) -> float:
 
 
 # ==============================
-# SCRAPER
+# VALIDATION & DEDUP (SAFE)
+# ==============================
+
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def validate_search_terms(terms: list[str]) -> list[str]:
+    """Remove termos vazios e duplicados"""
+    cleaned = []
+    seen = set()
+
+    for term in terms:
+        term = normalize_text(term)
+
+        if not term:
+            continue
+
+        if term in seen:
+            continue
+
+        seen.add(term)
+        cleaned.append(term)
+
+    return cleaned
+
+
+def validate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove registros inválidos"""
+    if df.empty:
+        return df
+
+    df = df[df["name"].notna() & (df["name"] != "")]
+    df = df[df["latitude"].notna() & df["longitude"].notna()]
+
+    return df
+
+
+def deduplicate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove duplicados por coordenada"""
+    if df.empty:
+        return df
+
+    return df.drop_duplicates(subset=["latitude", "longitude"], keep="first")
+
+
+# ==============================
+# SCRAPER (INTACTO)
 # ==============================
 
 
@@ -112,7 +153,6 @@ def scrape_data(search_term):
         page = browser.new_page()
 
         page.goto("https://www.google.com/maps", timeout=60000)
-
         page.get_by_label("Pesquise no Google Maps").wait_for()
 
         print(f"\n🔎 Searching for: {search_term}")
@@ -123,7 +163,6 @@ def scrape_data(search_term):
         page.get_by_role("button", name="Pesquisar").click()
         page.wait_for_timeout(5000)
 
-        # Scroll para carregar resultados
         page.hover('//a[contains(@href, "https://www.google.com/maps/place")]')
 
         previously_counted = 0
@@ -189,14 +228,12 @@ def scrape_data(search_term):
                     else ""
                 )
 
-                # ⭐ Reviews count corrigido
                 if page.locator("//div[2]/span[2]/span/span").count() > 0:
                     text = page.locator("//div[2]/span[2]/span/span").get_attribute(
                         "aria-label"
                     )
                     business.reviews_count = parse_int(text)
 
-                # ⭐ Reviews average corrigido
                 if page.locator('//div[@role="img"]').count() > 0:
                     text = page.locator('//div[@role="img"]').get_attribute(
                         "aria-label"
@@ -234,7 +271,7 @@ def scrape_data(search_term):
 # ==============================
 
 if __name__ == "__main__":
-    search_terms = read_search_terms("input.txt")
+    search_terms = validate_search_terms(read_search_terms("input.txt"))
 
     all_dataframes = []
 
@@ -243,6 +280,11 @@ if __name__ == "__main__":
 
         result = scrape_data(term)
         df = result.dataframe()
+
+        # validação e dedup (safe)
+        df = validate_dataframe(df)
+        df = deduplicate_dataframe(df)
+
         all_dataframes.append(df)
 
         term_folder = f"output/por_termo/{slugify(term)}"
@@ -255,7 +297,10 @@ if __name__ == "__main__":
 
     df_all = pd.concat(all_dataframes, ignore_index=True)
 
+    # deduplicação global
+    df_all = deduplicate_dataframe(df_all)
+
     df_all.to_csv("output/consolidado/todos_os_termos.csv", index=False)
     df_all.to_excel("output/consolidado/todos_os_termos.xlsx", index=False)
 
-    print("\n🔥 Pipeline finalizado — tudo organizado!")
+    print("\n🔥 Pipeline finalizado — validado e sem duplicados!")
