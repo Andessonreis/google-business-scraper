@@ -1,157 +1,261 @@
-from flask import Flask, jsonify, request
 from playwright.sync_api import sync_playwright
 from dataclasses import dataclass, asdict, field
 import pandas as pd
 import os
-import time
-import threading
+import re
 
-app = Flask(__name__)
+
+# ==============================
+# MODELS
+# ==============================
+
 
 @dataclass
 class Business:
-    """holds business data"""
-    
-    name: str = None  # Nome do negócio
-    address: str = None  # Endereço completo
-    website: str = None  # URL do site oficial
-    phone_number: str = None  # Número de telefone
-    category: str = None  # Categoria do negócio (ex.: restaurante, loja)
-    opening_hours: dict = None  # Horário de funcionamento, ex.: {"Segunda": "08:00-18:00", ...}
-    reviews_count: int = None  # Número total de avaliações
-    reviews_average: float = None  # Média das avaliações (0.0 a 5.0)
-    latitude: float = None  # Latitude do local
-    longitude: float = None  # Longitude do local
-    price_level: int = None  # Nível de preço (1 = barato, 5 = caro)
+    name: str = None
+    address: str = None
+    website: str = None
+    phone_number: str = None
+    category: str = None
+    opening_hours: dict = None
+    reviews_count: int = None
+    reviews_average: float = None
+    latitude: float = None
+    longitude: float = None
+    price_level: int = None
+
 
 @dataclass
 class BusinessList:
-    """holds list of Business objects,
-    and save to both excel and csv
-    """
-
     business_list: list[Business] = field(default_factory=list)
-    save_at = "output"
 
     def dataframe(self):
-        """transform business_list to pandas dataframe"""
         return pd.json_normalize(
             (asdict(business) for business in self.business_list), sep="_"
         )
 
-    def save_to_excel(self, filename):
-        """saves pandas dataframe to excel (xlsx) file"""
-        if not os.path.exists(self.save_at):
-            os.makedirs(self.save_at)
-        self.dataframe().to_excel(f"output/{filename}.xlsx", index=False)
 
-    def save_to_csv(self, filename):
-        """saves pandas dataframe to csv file"""
-        if not os.path.exists(self.save_at):
-            os.makedirs(self.save_at)
-        self.dataframe().to_csv(f"output/{filename}.csv", index=False)
+# ==============================
+# HELPERS
+# ==============================
 
 
-def extract_coordinates_from_url(url: str) -> tuple[float, float]:
-    """helper function to extract coordinates from url"""
+def slugify(text):
+    return (
+        text.lower()
+        .replace(" ", "_")
+        .replace("ã", "a")
+        .replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+        .replace("ç", "c")
+    )
+
+
+def read_search_terms(file_path="input.txt"):
+    with open(file_path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def extract_coordinates_from_url(url: str):
     coordinates = url.split("/@")[-1].split("/")[0]
-    return float(coordinates.split(",")[0]), float(coordinates.split(",")[1])
+    lat, lon = coordinates.split(",")[:2]
+    return float(lat), float(lon)
 
 
-def scrape_data(search_list):
-    """Main scraping logic"""
+# ==============================
+# 🔢 PARSERS ROBUSTOS
+# ==============================
+
+
+def parse_int(text: str) -> int:
+    """
+    Extrai inteiro de textos como:
+    '1.623 avaliações', '1,623 reviews', etc.
+    """
+    digits = re.sub(r"\D", "", text)
+    return int(digits) if digits else 0
+
+
+def parse_float(text: str) -> float:
+    """
+    Extrai float de textos como:
+    '4,5 estrelas', '4.5 stars'
+    """
+    match = re.search(r"[\d.,]+", text)
+    if not match:
+        return 0.0
+
+    value = match.group(0)
+
+    # se tem vírgula como decimal (pt-BR)
+    if "," in value and value.count(",") == 1:
+        value = value.replace(".", "").replace(",", ".")
+    else:
+        value = value.replace(",", "")
+
+    return float(value)
+
+
+# ==============================
+# SCRAPER
+# ==============================
+
+
+def scrape_data(search_term):
     business_list = BusinessList()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True) 
+        browser = p.chromium.launch(headless=False)
         page = browser.new_page()
 
         page.goto("https://www.google.com/maps", timeout=60000)
+
+        page.get_by_label("Pesquise no Google Maps").wait_for()
+
+        print(f"\n🔎 Searching for: {search_term}")
+
+        search_box = page.get_by_label("Pesquise no Google Maps")
+        search_box.fill(search_term)
+
+        page.get_by_role("button", name="Pesquisar").click()
         page.wait_for_timeout(5000)
 
-        for search_for in search_list:
-            print(f"-----\nSearching for: {search_for}")
+        # Scroll para carregar resultados
+        page.hover('//a[contains(@href, "https://www.google.com/maps/place")]')
 
-            page.locator('//input[@id="searchboxinput"]').fill(search_for)
+        previously_counted = 0
+        while True:
+            page.mouse.wheel(0, 10000)
             page.wait_for_timeout(3000)
 
-            page.keyboard.press("Enter")
-            page.wait_for_timeout(5000)
-
-            # scrolling to load more businesses
-            page.hover('//a[contains(@href, "https://www.google.com/maps/place")]')
-
-            previously_counted = 0
-            while True:
-                page.mouse.wheel(0, 10000)
-                page.wait_for_timeout(3000)
-
-                # Check if the number of listings increased, continue if true
-                current_count = page.locator(
-                    '//a[contains(@href, "https://www.google.com/maps/place")]'
-                ).count()
-                
-                if current_count == previously_counted:
-                    print("Reached all available listings.")
-                    break
-                else:
-                    previously_counted = current_count
-                    print(f"Currently Scraped: {current_count}")
-
-            # Scraping the business details
-            listings = page.locator(
+            current_count = page.locator(
                 '//a[contains(@href, "https://www.google.com/maps/place")]'
-            ).all()
+            ).count()
 
-            for listing in listings:
-                try:
-                    listing.click()
-                    page.wait_for_timeout(15000)
+            if current_count == previously_counted:
+                print("Reached all available listings.")
+                break
+            else:
+                previously_counted = current_count
+                print(f"Currently Scraped: {current_count}")
 
-                    # Select the elements to scrape
-                    business = Business()
-                    business.name = page.locator('//h1[@class="DUwDvf lfPIob"]').inner_text() if page.locator('//h1[@class="DUwDvf lfPIob"]').count() > 0 else ""
-                    business.address = page.locator('//button[@data-item-id="address"]//div[contains(@class, "fontBodyMedium")]').inner_text() if page.locator('//button[@data-item-id="address"]//div[contains(@class, "fontBodyMedium")]').count() > 0 else ""
-                    business.website = page.locator("//a[contains(@aria-label, 'Website')]").get_attribute('href') if page.locator("//a[contains(@aria-label, 'Website')]").count() > 0 else "Not Given"
-                    business.phone_number = page.locator('//button[contains(@data-item-id, "phone:tel:")]//div[contains(@class, "fontBodyMedium")]').inner_text() if page.locator('//button[contains(@data-item-id, "phone:tel:")]//div[contains(@class, "fontBodyMedium")]').count() > 0 else ""
-                    business.reviews_count = int(page.locator("//div[2]/span[2]/span/span").get_attribute('aria-label').split()[0].replace(",", "")) if page.locator("//div[2]/span[2]/span/span").count() > 0 else 0
-                    business.reviews_average = float(page.locator('//div[@jsaction="pane.reviewChart.moreReviews"]//div[@role="img"]').get_attribute('aria-label').split()[0].replace(",", ".")) if page.locator('//div[@jsaction="pane.reviewChart.moreReviews"]//div[@role="img"]').count() > 0 else 0
-                    business.category = page.locator('//div[contains(@class, "fontBodyMedium")]//button[contains(@class, "DkEaL")]').inner_text() if page.locator('//div[contains(@class, "fontBodyMedium")]//button[contains(@class, "DkEaL")]').count() > 0 else ""
-                    business.latitude, business.longitude = extract_coordinates_from_url(page.url)
+        listings = page.locator(
+            '//a[contains(@href, "https://www.google.com/maps/place")]'
+        ).all()
 
-                    business_list.business_list.append(business)
+        for listing in listings:
+            try:
+                listing.click()
+                page.wait_for_timeout(8000)
 
-                except Exception as e:
-                    print(f"Error: {e}")
-            
-            print(f"Finished scraping {search_for}")
-            
+                business = Business()
+
+                business.name = (
+                    page.locator("//h1").inner_text()
+                    if page.locator("//h1").count() > 0
+                    else ""
+                )
+
+                business.address = (
+                    page.locator(
+                        '//button[@data-item-id="address"]//div[contains(@class, "fontBodyMedium")]'
+                    ).inner_text()
+                    if page.locator(
+                        '//button[@data-item-id="address"]//div[contains(@class, "fontBodyMedium")]'
+                    ).count()
+                    > 0
+                    else ""
+                )
+
+                business.website = (
+                    page.locator("//a[contains(@aria-label, 'Website')]").get_attribute(
+                        "href"
+                    )
+                    if page.locator("//a[contains(@aria-label, 'Website')]").count() > 0
+                    else ""
+                )
+
+                business.phone_number = (
+                    page.locator(
+                        '//button[contains(@data-item-id, "phone:tel:")]//div[contains(@class, "fontBodyMedium")]'
+                    ).inner_text()
+                    if page.locator(
+                        '//button[contains(@data-item-id, "phone:tel:")]//div[contains(@class, "fontBodyMedium")]'
+                    ).count()
+                    > 0
+                    else ""
+                )
+
+                # ⭐ Reviews count corrigido
+                if page.locator("//div[2]/span[2]/span/span").count() > 0:
+                    text = page.locator("//div[2]/span[2]/span/span").get_attribute(
+                        "aria-label"
+                    )
+                    business.reviews_count = parse_int(text)
+
+                # ⭐ Reviews average corrigido
+                if page.locator('//div[@role="img"]').count() > 0:
+                    text = page.locator('//div[@role="img"]').get_attribute(
+                        "aria-label"
+                    )
+                    business.reviews_average = parse_float(text)
+
+                business.category = (
+                    page.locator(
+                        '//div[contains(@class, "fontBodyMedium")]//button[contains(@class, "DkEaL")]'
+                    ).inner_text()
+                    if page.locator(
+                        '//div[contains(@class, "fontBodyMedium")]//button[contains(@class, "DkEaL")]'
+                    ).count()
+                    > 0
+                    else ""
+                )
+
+                business.latitude, business.longitude = extract_coordinates_from_url(
+                    page.url
+                )
+
+                business_list.business_list.append(business)
+
+            except Exception as e:
+                print(f"Error: {e}")
+
+        print(f"Finished scraping {search_term}")
         browser.close()
 
     return business_list
 
 
-@app.route('/scrape', methods=['POST'])
-def scrape():
-    """API endpoint to trigger the scraping process"""
-    search_terms = request.json.get('search', [])
-    
-    if not search_terms:
-        return jsonify({"error": "No search terms provided"}), 400
-    
-    print("Starting scraping process...")
-    
-    # Scrape data in a separate thread to avoid blocking the server
-    threading.Thread(target=scrape_data, args=(search_terms,)).start()
-    
-    return jsonify({"message": "Scraping started successfully!"}), 200
+# ==============================
+# PIPELINE
+# ==============================
 
+if __name__ == "__main__":
+    search_terms = read_search_terms("input.txt")
 
-@app.route('/status', methods=['GET'])
-def status():
-    """API endpoint to check if the scraping is finished"""
-    return jsonify({"status": "scraping in progress"}), 200
+    all_dataframes = []
 
+    for term in search_terms:
+        print(f"\n===== PROCESSANDO: {term} =====")
 
-if __name__ == '__main__':
-    app.run(debug=True)
+        result = scrape_data(term)
+        df = result.dataframe()
+        all_dataframes.append(df)
+
+        term_folder = f"output/por_termo/{slugify(term)}"
+        os.makedirs(term_folder, exist_ok=True)
+
+        df.to_csv(f"{term_folder}/dados.csv", index=False)
+        df.to_excel(f"{term_folder}/dados.xlsx", index=False)
+
+    os.makedirs("output/consolidado", exist_ok=True)
+
+    df_all = pd.concat(all_dataframes, ignore_index=True)
+
+    df_all.to_csv("output/consolidado/todos_os_termos.csv", index=False)
+    df_all.to_excel("output/consolidado/todos_os_termos.xlsx", index=False)
+
+    print("\n🔥 Pipeline finalizado — tudo organizado!")
