@@ -149,7 +149,7 @@ def scrape_data(search_term):
     business_list = BusinessList()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=False)
         page = browser.new_page()
 
         page.goto("https://www.google.com/maps", timeout=60000)
@@ -193,7 +193,7 @@ def scrape_data(search_term):
                 business = Business()
 
                 business.name = (
-                    page.locator("//h1").inner_text()
+                    page.locator("//h1").last.inner_text()
                     if page.locator("//h1").count() > 0
                     else ""
                 )
@@ -234,10 +234,13 @@ def scrape_data(search_term):
                     )
                     business.reviews_count = parse_int(text)
 
-                if page.locator('//div[@role="img"]').count() > 0:
-                    text = page.locator('//div[@role="img"]').get_attribute(
-                        "aria-label"
-                    )
+                # Atualize esta parte dentro do seu try:
+                star_locator = page.locator(
+                    '//div[@role="img" and contains(@aria-label, "estrelas")]'
+                )
+
+                if star_locator.count() > 0:
+                    text = star_locator.first.get_attribute("aria-label")
                     business.reviews_average = parse_float(text)
 
                 business.category = (
