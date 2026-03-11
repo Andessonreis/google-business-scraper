@@ -6,6 +6,7 @@ import re
 import time
 import random
 
+
 # ==============================
 # MODELS
 # ==============================
@@ -67,7 +68,7 @@ def extract_coordinates_from_url(url: str):
 
 
 # ==============================
-# 🔢 PARSERS
+# 🔢 PARSERS & WHATSAPP VALIDATION
 # ==============================
 
 
@@ -89,6 +90,34 @@ def parse_float(text: str) -> float:
         value = value.replace(",", "")
 
     return float(value)
+
+
+def validate_and_format_whatsapp(phone: str):
+    """
+    Limpa o número, valida se é um celular brasileiro real e o formata para WhatsApp (55 + DDD + Numero).
+    Retorna o número limpo se for válido, ou None se for inválido.
+    """
+    if not phone or pd.isna(phone):
+        return None
+
+    # Remove tudo que não for número
+    digits = re.sub(r"\D", "", str(phone))
+
+    # Se a pessoa digitou com o DDI do Brasil (55), remove temporariamente
+    if digits.startswith("55") and len(digits) >= 12:
+        digits = digits[2:]
+
+    # Se a pessoa colocou um 0 na frente do DDD (ex: 079 99999-9999)
+    if digits.startswith("0") and len(digits) == 12:
+        digits = digits[1:]
+
+    # Um celular brasileiro válido (sem DDI) TEM que ter 11 dígitos (Ex: 79 9 9999 9999)
+    # E o terceiro dígito (primeiro após o DDD) TEM que ser 9.
+    if len(digits) == 11 and digits[2] == "9":
+        # Retorna formatado no padrão internacional pronto para APIs de WhatsApp
+        return f"55{digits}"
+
+    return None
 
 
 # ==============================
@@ -139,17 +168,17 @@ def deduplicate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_only_cellphones(df: pd.DataFrame) -> pd.DataFrame:
-    """Filtra o DataFrame para manter apenas linhas com números de celular."""
+    """Aplica a validação rigorosa de WhatsApp e remove as linhas com números inválidos."""
     if df.empty or "phone_number" not in df.columns:
         return df
 
-    # Regex para celular brasileiro: (XX) 9XXXX-XXXX ou similar
-    celular_pattern = r"\(?\d{2}\)?\s*9\d{4}-?\d{4}"
+    # Cria uma nova coluna com o número formatado para o WhatsApp (ou None se for fixo/inválido)
+    df["whatsapp_number"] = df["phone_number"].apply(validate_and_format_whatsapp)
 
-    # Aplica o filtro
-    df = df[df["phone_number"].str.contains(celular_pattern, na=False, regex=True)]
+    # Filtra mantendo apenas as linhas onde o 'whatsapp_number' não é vazio
+    df_filtered = df[df["whatsapp_number"].notna()].copy()
 
-    return df
+    return df_filtered
 
 
 # ==============================
@@ -174,9 +203,8 @@ def scrape_data(search_term):
 
         page.get_by_role("button", name="Pesquisar").click()
 
-        # === INÍCIO DA CORREÇÃO ===
+        # Try-except adicionado anteriormente para evitar quebras
         try:
-            # Espera até 10 segundos para ver se a lista de resultados aparece
             page.locator(
                 '//a[contains(@href, "https://www.google.com/maps/place")]'
             ).first.wait_for(timeout=10000)
@@ -185,11 +213,9 @@ def scrape_data(search_term):
                 f"⚠️ Nenhum resultado encontrado ou lista não carregada para: {search_term}. Pulando..."
             )
             browser.close()
-            return business_list  # Retorna a lista vazia e o pipeline segue o jogo
+            return business_list
 
-        # Se passou do try, significa que tem lista, então podemos fazer o hover
         page.hover('//a[contains(@href, "https://www.google.com/maps/place")]')
-        # === FIM DA CORREÇÃO ===
 
         previously_counted = 0
         while True:
@@ -304,11 +330,8 @@ if __name__ == "__main__":
     all_dataframes = []
 
     for index, term in enumerate(search_terms):
-        # Evita delay na PRIMEIRA busca, mas aplica em todas as subsequentes
         if index > 0:
-            delay = random.uniform(
-                15.0, 30.0
-            )  # Sorteia um número entre 15 e 30 segundos
+            delay = random.uniform(15.0, 30.0)
             print(
                 f"\n⏳ Aguardando {delay:.2f} segundos para evitar bloqueios do Google..."
             )
@@ -319,11 +342,10 @@ if __name__ == "__main__":
         result = scrape_data(term)
         df = result.dataframe()
 
-        # validação e dedup (safe)
         df = validate_dataframe(df)
         df = deduplicate_dataframe(df)
 
-        # Filtra logo aqui para não salvar lixo nas pastas individuais
+        # Filtro Rigoroso
         df = filter_only_cellphones(df)
 
         if not df.empty:
@@ -335,26 +357,25 @@ if __name__ == "__main__":
             df.to_csv(f"{term_folder}/dados_celular.csv", index=False)
             df.to_excel(f"{term_folder}/dados_celular.xlsx", index=False)
         else:
-            print(f"Nenhum celular encontrado para o termo: {term}")
+            print(
+                f"Nenhum celular válido para WhatsApp encontrado para o termo: {term}"
+            )
 
     os.makedirs("output/consolidado", exist_ok=True)
 
     if all_dataframes:
         df_all = pd.concat(all_dataframes, ignore_index=True)
-
-        # deduplicação global
         df_all = deduplicate_dataframe(df_all)
 
-        # Salva a única planilha final com todos os celulares
         df_all.to_csv("output/consolidado/todos_os_contadores_celular.csv", index=False)
         df_all.to_excel(
             "output/consolidado/todos_os_contadores_celular.xlsx", index=False
         )
 
         print(
-            f"\n🔥 Pipeline finalizado! {len(df_all)} contadores com celular encontrados."
+            f"\n🔥 Pipeline finalizado! {len(df_all)} contadores com WhatsApp válido encontrados."
         )
     else:
         print(
-            "\n❌ Nenhum dado com número de celular foi encontrado em todas as buscas."
+            "\n❌ Nenhum dado com número de WhatsApp válido foi encontrado em todas as buscas."
         )
