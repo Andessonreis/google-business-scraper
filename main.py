@@ -3,7 +3,8 @@ from dataclasses import dataclass, asdict, field
 import pandas as pd
 import os
 import re
-
+import time
+import random
 
 # ==============================
 # MODELS
@@ -91,7 +92,7 @@ def parse_float(text: str) -> float:
 
 
 # ==============================
-# VALIDATION & DEDUP (SAFE)
+# VALIDATION, DEDUP & FILTERING
 # ==============================
 
 
@@ -108,13 +109,10 @@ def validate_search_terms(terms: list[str]) -> list[str]:
 
     for term in terms:
         term = normalize_text(term)
-
         if not term:
             continue
-
         if term in seen:
             continue
-
         seen.add(term)
         cleaned.append(term)
 
@@ -140,6 +138,20 @@ def deduplicate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop_duplicates(subset=["latitude", "longitude"], keep="first")
 
 
+def filter_only_cellphones(df: pd.DataFrame) -> pd.DataFrame:
+    """Filtra o DataFrame para manter apenas linhas com números de celular."""
+    if df.empty or "phone_number" not in df.columns:
+        return df
+
+    # Regex para celular brasileiro: (XX) 9XXXX-XXXX ou similar
+    celular_pattern = r"\(?\d{2}\)?\s*9\d{4}-?\d{4}"
+
+    # Aplica o filtro
+    df = df[df["phone_number"].str.contains(celular_pattern, na=False, regex=True)]
+
+    return df
+
+
 # ==============================
 # SCRAPER (INTACTO)
 # ==============================
@@ -161,9 +173,23 @@ def scrape_data(search_term):
         search_box.fill(search_term)
 
         page.get_by_role("button", name="Pesquisar").click()
-        page.wait_for_timeout(5000)
 
+        # === INÍCIO DA CORREÇÃO ===
+        try:
+            # Espera até 10 segundos para ver se a lista de resultados aparece
+            page.locator(
+                '//a[contains(@href, "https://www.google.com/maps/place")]'
+            ).first.wait_for(timeout=10000)
+        except Exception:
+            print(
+                f"⚠️ Nenhum resultado encontrado ou lista não carregada para: {search_term}. Pulando..."
+            )
+            browser.close()
+            return business_list  # Retorna a lista vazia e o pipeline segue o jogo
+
+        # Se passou do try, significa que tem lista, então podemos fazer o hover
         page.hover('//a[contains(@href, "https://www.google.com/maps/place")]')
+        # === FIM DA CORREÇÃO ===
 
         previously_counted = 0
         while True:
@@ -234,7 +260,6 @@ def scrape_data(search_term):
                     )
                     business.reviews_count = parse_int(text)
 
-                # Atualize esta parte dentro do seu try:
                 star_locator = page.locator(
                     '//div[@role="img" and contains(@aria-label, "estrelas")]'
                 )
@@ -261,7 +286,7 @@ def scrape_data(search_term):
                 business_list.business_list.append(business)
 
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"Error scraping a specific listing: {e}")
 
         print(f"Finished scraping {search_term}")
         browser.close()
@@ -278,8 +303,18 @@ if __name__ == "__main__":
 
     all_dataframes = []
 
-    for term in search_terms:
-        print(f"\n===== PROCESSANDO: {term} =====")
+    for index, term in enumerate(search_terms):
+        # Evita delay na PRIMEIRA busca, mas aplica em todas as subsequentes
+        if index > 0:
+            delay = random.uniform(
+                15.0, 30.0
+            )  # Sorteia um número entre 15 e 30 segundos
+            print(
+                f"\n⏳ Aguardando {delay:.2f} segundos para evitar bloqueios do Google..."
+            )
+            time.sleep(delay)
+
+        print(f"\n===== PROCESSANDO ({index + 1}/{len(search_terms)}): {term} =====")
 
         result = scrape_data(term)
         df = result.dataframe()
@@ -288,22 +323,38 @@ if __name__ == "__main__":
         df = validate_dataframe(df)
         df = deduplicate_dataframe(df)
 
-        all_dataframes.append(df)
+        # Filtra logo aqui para não salvar lixo nas pastas individuais
+        df = filter_only_cellphones(df)
 
-        term_folder = f"output/por_termo/{slugify(term)}"
-        os.makedirs(term_folder, exist_ok=True)
+        if not df.empty:
+            all_dataframes.append(df)
 
-        df.to_csv(f"{term_folder}/dados.csv", index=False)
-        df.to_excel(f"{term_folder}/dados.xlsx", index=False)
+            term_folder = f"output/por_termo/{slugify(term)}"
+            os.makedirs(term_folder, exist_ok=True)
+
+            df.to_csv(f"{term_folder}/dados_celular.csv", index=False)
+            df.to_excel(f"{term_folder}/dados_celular.xlsx", index=False)
+        else:
+            print(f"Nenhum celular encontrado para o termo: {term}")
 
     os.makedirs("output/consolidado", exist_ok=True)
 
-    df_all = pd.concat(all_dataframes, ignore_index=True)
+    if all_dataframes:
+        df_all = pd.concat(all_dataframes, ignore_index=True)
 
-    # deduplicação global
-    df_all = deduplicate_dataframe(df_all)
+        # deduplicação global
+        df_all = deduplicate_dataframe(df_all)
 
-    df_all.to_csv("output/consolidado/todos_os_termos.csv", index=False)
-    df_all.to_excel("output/consolidado/todos_os_termos.xlsx", index=False)
+        # Salva a única planilha final com todos os celulares
+        df_all.to_csv("output/consolidado/todos_os_contadores_celular.csv", index=False)
+        df_all.to_excel(
+            "output/consolidado/todos_os_contadores_celular.xlsx", index=False
+        )
 
-    print("\n🔥 Pipeline finalizado — validado e sem duplicados!")
+        print(
+            f"\n🔥 Pipeline finalizado! {len(df_all)} contadores com celular encontrados."
+        )
+    else:
+        print(
+            "\n❌ Nenhum dado com número de celular foi encontrado em todas as buscas."
+        )
