@@ -325,7 +325,29 @@ def scrape_data(search_term):
 # ==============================
 
 if __name__ == "__main__":
+    import argparse
+    import math
+
+    # Configuração para dividir em múltiplos terminais
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--parte", type=int, default=1, help="Qual parte rodar (ex: 1, 2, 3...)"
+    )
+    parser.add_argument("--total", type=int, default=1, help="Total de partes (ex: 4)")
+    args = parser.parse_args()
+
     search_terms = validate_search_terms(read_search_terms("input.txt"))
+
+    # Fatiando a lista de acordo com a parte atual
+    tamanho_fatia = math.ceil(len(search_terms) / args.total)
+    inicio_idx = (args.parte - 1) * tamanho_fatia
+    fim_idx = inicio_idx + tamanho_fatia
+    search_terms = search_terms[inicio_idx:fim_idx]
+
+    print(f"\n🚀 Iniciando PARTE {args.parte} de {args.total}")
+    print(
+        f"📋 Processando {len(search_terms)} termos (Índice {inicio_idx} ao {fim_idx}).\n"
+    )
 
     all_dataframes = []
 
@@ -337,23 +359,21 @@ if __name__ == "__main__":
             )
             time.sleep(delay)
 
-        print(f"\n===== PROCESSANDO ({index + 1}/{len(search_terms)}): {term} =====")
+        print(
+            f"\n===== PROCESSANDO ({index + 1}/{len(search_terms)} da Parte {args.parte}): {term} ====="
+        )
 
         result = scrape_data(term)
         df = result.dataframe()
 
         df = validate_dataframe(df)
         df = deduplicate_dataframe(df)
-
-        # Filtro Rigoroso
         df = filter_only_cellphones(df)
 
         if not df.empty:
             all_dataframes.append(df)
-
             term_folder = f"output/por_termo/{slugify(term)}"
             os.makedirs(term_folder, exist_ok=True)
-
             df.to_csv(f"{term_folder}/dados_celular.csv", index=False)
             df.to_excel(f"{term_folder}/dados_celular.xlsx", index=False)
         else:
@@ -367,15 +387,15 @@ if __name__ == "__main__":
         df_all = pd.concat(all_dataframes, ignore_index=True)
         df_all = deduplicate_dataframe(df_all)
 
-        df_all.to_csv("output/consolidado/todos_os_contadores_celular.csv", index=False)
-        df_all.to_excel(
-            "output/consolidado/todos_os_contadores_celular.xlsx", index=False
-        )
+        # Salva o arquivo consolidado apenas dessa parte para não dar conflito!
+        csv_name = f"output/consolidado/contadores_celular_parte_{args.parte}.csv"
+        excel_name = f"output/consolidado/contadores_celular_parte_{args.parte}.xlsx"
+
+        df_all.to_csv(csv_name, index=False)
+        df_all.to_excel(excel_name, index=False)
 
         print(
-            f"\n🔥 Pipeline finalizado! {len(df_all)} contadores com WhatsApp válido encontrados."
+            f"\n🔥 Parte {args.parte} finalizada! {len(df_all)} contatos encontrados."
         )
     else:
-        print(
-            "\n❌ Nenhum dado com número de WhatsApp válido foi encontrado em todas as buscas."
-        )
+        print(f"\n❌ Nenhum dado encontrado na Parte {args.parte}.")
